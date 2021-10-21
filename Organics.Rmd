@@ -1,0 +1,300 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### load library
+```{r, warning=FALSE, message=FALSE}
+library(writexl)
+library(caret)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(ggplot2)
+library(kableExtra)
+library(GGally)
+library(kableExtra) # -- make nice looking resutls when we knitt 
+library(vip)        # --  tidymodels variable importance
+library(fastshap)   # -- shapley values for variable importance 
+library(MASS)
+library(rpart.plot) # -- plotting decision trees 
+```
+
+
+### data cleasing
+
+```{r}
+org <- read_csv("organics.csv") %>%clean_names()
+org %>% skim()
+#factor:dem_cluster_group,dem_gender,dem_reg,dem_tv_reg,prom_class
+#reject id, dem_cluster,target_amt
+```
+
+
+### exploratory analysis
+
+```{r}
+#class
+org %>%
+  group_by(prom_class)%>%
+  summarize(rate=mean(target_buy,na.rm=TRUE))%>%
+  arrange(rate)
+```
+
+```{r}
+options(scipen=55)
+bar<- function(z){
+  org %>%
+  ggplot(aes(x=!!as.name(z),fill=as.factor(target_buy)))+
+  geom_bar(position="fill")
+}
+for (c in names(org%>%select_if(is.character))) {
+  chr <-bar(c)
+  print(chr)
+}
+
+
+boxp<- function(z){
+  org %>%
+  ggplot(aes(x=as.factor(target_buy),y=!!as.name(z)))+
+  geom_boxplot()
+}
+for (c in names(org%>%select_if(is.numeric))) {
+  a <-boxp(c)
+  print(a)
+}
+org %>%
+  group_by(prom_class)%>%
+  summarize(buy_rate=mean(target_buy,na.rm=TRUE))%>%
+  ggplot(aes(x=reorder(prom_class,-buy_rate),y=buy_rate,fill=buy_rate))+
+  geom_col()+
+  labs(x="prom_class",y="buy_rate")
+
+
+org %>%
+  mutate(dem_gender=replace_na(dem_gender, "F"))%>%
+  ggplot(aes(x=dem_gender,fill=as.factor(target_buy)))+
+  geom_bar(position="fill")
+```
+```{r}
+org_prep <- org%>%
+  mutate_if(is.character,as.factor)%>%
+  mutate(target_buy=as.factor(target_buy))
+```
+
+
+### split 
+
+```{r}
+set.seed(43)
+
+# -- performs our train / test split 
+org_split <- initial_split(org_prep, prop = 0.7)
+
+# -- extract the training data 
+org_train <- training(org_split)
+# -- extract the test data 
+org_test <- testing(org_split)
+
+sprintf("Train PCT : %1.2f%%", nrow(org_train)/ nrow(org) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(org_test)/ nrow(org) * 100)
+
+
+```
+
+###recipe
+
+```{r}
+recipe_org <- recipe(target_buy~.,data=org_train)%>%
+  step_rm(id, dem_cluster,target_amt)%>%
+  step_novel(all_nominal(),-all_outcomes())%>%
+  step_impute_mode(all_nominal(),-all_outcomes())%>%
+  step_impute_median(all_numeric())%>%
+  step_dummy(all_nominal(),-all_outcomes())%>%
+  prep()
+```
+
+
+bake
+```{r}
+bake_org_train <- bake(recipe_org,new_data=org_train)
+bake_org_test <- bake(recipe_org,new_data=org_test)
+```
+
+
+
+#logistic model
+
+```{r}
+org_glm <- logistic_reg(mode = "classification")%>%
+  set_engine("glm")%>%
+  fit(target_buy~., data=bake_org_train)
+
+tidy(org_glm$fit)%>%
+  mutate(across(is.numeric,round,4))%>%
+  filter(p.value<=0.05)
+```
+
+### stepwise mothod to remove variables
+```{r}
+# steplog <- glm(target_buy ~ ., data = bake_org_train, family=binomial(link="logit"))
+# step <- stepAIC(steplog, direction="both")
+# summary(step)
+```
+
+```{r}
+org_glm_1<- logistic_reg(mode = "classification")%>%
+  set_engine("glm")%>%
+  fit(target_buy~dem_affl+dem_age+dem_gender_M+dem_gender_U, data=bake_org_train)
+
+tidy(org_glm_1$fit)%>%
+  mutate(across(is.numeric,round,4))
+
+predict(org_glm_1, bake_org_train, type = "prob") %>%
+  bind_cols(.,predict(org_glm_1, bake_org_train)) %>%
+  bind_cols(.,bake_org_train) -> scored_train_glm_1
+
+predict(org_glm_1, bake_org_test, type = "prob") %>%
+  bind_cols(.,predict(org_glm_1, bake_org_test)) %>%
+  bind_cols(.,bake_org_test) -> scored_test_glm_1
+
+scored_train_glm_1 %>% 
+  metrics(target_buy,.pred_0,, estimate =.pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_glm_1 %>%
+               metrics(target_buy,.pred_0, estimate =.pred_class) %>%
+               mutate(part="testing")
+  )%>%
+  filter(.metric == "roc_auc" | .metric == "accuracy" )%>%
+  arrange(.metric)
+
+org_glm_1 %>%
+  vip(num_features = 5)
+```
+
+###fit in rpart decision tree
+
+```{r}
+org_rpart_1 <- decision_tree(mode="classification") %>%
+                  set_engine("rpart") %>%
+                  fit(target_buy ~ ., data = bake_org_train)
+
+
+org_rpart_1$fit
+
+options(scipen=0)
+rpart.plot(org_rpart_1$fit, roundint=FALSE, extra = 4)
+```
+
+```{r}
+org_rpart_2 <- decision_tree(mode="classification",
+                            cost_complexity = 0.0013,
+                            tree_depth = 5,
+                            min_n = 2) %>%
+                  set_engine("rpart") %>%
+                  fit(target_buy~., data = bake_org_train)
+
+org_rpart_2$fit
+
+options(scipen = 0) # why we need this because the R set this as default value
+
+rpart.plot(org_rpart_2$fit, roundint=TRUE, extra=4) 
+```
+
+
+### tuning cost complexity
+
+```{r}
+set.seed(123)
+treemod2 <- train(
+                  target_buy~., data = bake_org_train, 
+                  method="rpart",
+                  trControl = trainControl("cv", number = 10), #across validation: average the accuracy across all 10 test sets
+                  tuneLength = 10  #consider 10 values of CP
+                  )
+
+#Plot model accuracy vs different values of cp (complexity parameter)
+plot(treemod2)
+treemod2$bestTune
+```
+
+```{r}
+predict(org_rpart_2, bake_org_train, type = "prob") %>%
+  bind_cols(.,predict(org_rpart_2, bake_org_train)) %>%
+  bind_cols(.,bake_org_train) -> scored_train_rpart_2
+
+predict(org_rpart_2, bake_org_test, type = "prob") %>%
+  bind_cols(.,predict(org_rpart_2, bake_org_test)) %>%
+  bind_cols(.,bake_org_test) -> scored_test_rpart_2
+
+scored_train_rpart_2 %>% 
+  metrics(target_buy,.pred_0,, estimate =.pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_rpart_2 %>%
+               metrics(target_buy,.pred_0, estimate =.pred_class) %>%
+               mutate(part="testing")
+  )%>%
+  filter(.metric == "roc_auc" |.metric == "accuracy" )
+```
+
+### fit in c5.0
+
+```{r}
+library(libcoin)
+library(C50)
+org_c_1 <- decision_tree(mode="classification",
+                            cost_complexity = 0.0013,
+                            tree_depth = 20,
+                            min_n = 2) %>%
+                  set_engine("C5.0") %>%
+                  fit(target_buy~dem_affl+dem_age+dem_cluster_group_C+dem_cluster_group_F+dem_gender_M+dem_gender_U+dem_tv_reg_Yorkshire+dem_reg_North, data = bake_org_train)
+
+org_c_1$fit
+
+vars <- c('dem_affl','dem_age','dem_cluster_group','dem_gender','dem_tv_reg')
+c5_tree <- C5.0(x = org_train[,vars], y = org_train$target_buy)
+
+summary(c5_tree)
+plot(c5_tree)
+
+```
+```{r}
+predict(org_c_1, bake_org_train, type = "prob") %>%
+  bind_cols(.,predict(org_c_1, bake_org_train)) %>%
+  bind_cols(.,bake_org_train) -> scored_train_c_2
+
+predict(org_c_1, bake_org_test, type = "prob") %>%
+  bind_cols(.,predict(org_c_1, bake_org_test)) %>%
+  bind_cols(.,bake_org_test) -> scored_test_c_2
+
+scored_train_c_2 %>% 
+  metrics(target_buy,.pred_0,, estimate =.pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_c_2 %>%
+               metrics(target_buy,.pred_0, estimate =.pred_class) %>%
+               mutate(part="testing")
+  )%>%
+  filter(.metric == "roc_auc"|.metric == "accuracy" )
+```
+```{r}
+set.seed(123)
+treemod2 <- train(
+                  target_buy~., data = bake_org_train, 
+                  method="C5.0",
+                  trControl = trainControl("cv", number = 10), #across validation: average the accuracy across all 10 test sets
+                  tuneLength = 10  #consider 10 values of CP
+                  )
+
+#Plot model accuracy vs different values of cp (complexity parameter)
+plot(treemod2)
+treemod2$bestTune
+```
+
+
+
+
